@@ -66,6 +66,7 @@ library DataTypes {
         uint256 pubCount;
         address followModule;
         address followNFT;
+        address personaNFT;     //Linkage to a Profile NFT
         string handle;
         string imageURI;
         string followNFTURI;

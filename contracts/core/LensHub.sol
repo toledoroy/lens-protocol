@@ -25,12 +25,31 @@ import {VersionedInitializable} from '../upgradeability/VersionedInitializable.s
  * number of NFT contracts and interactions at once. For that reason, we've made two quirky design decisions:
  *      1. Both Follow & Collect NFTs invoke an LensHub callback on transfer with the sole purpose of emitting an event.
  *      2. Almost every event in the protocol emits the current block timestamp, reducing the need to fetch it manually.
+ * 
+ *
+ * Planned Changs:
+ * 1. Hub Module: Groups
+ * 2. Detabchable Profiles
+ *
  */
 contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiState, LensHubStorage {
-    uint256 internal constant REVISION = 1;
+    uint256 internal constant REVISION = 2;
 
     address internal immutable FOLLOW_NFT_IMPL;
     address internal immutable COLLECT_NFT_IMPL;
+
+
+
+
+    /**
+     * @dev Hub's Groups - Hub Owned NFT Representing Public Groups
+     * This should probably support multiple module implementation, and possibly multiple NFT implemetations as well
+     */
+    address internal immutable GROUP_NFT_IMPL;  
+    
+    // address internal immutable PROFILE_NFT_IMPL;        //NO. Allow for various contracts to be used for profiles
+
+
 
     /**
      * @dev This modifier reverts if the caller is not the configured governance address.
@@ -284,6 +303,18 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         _validateRecoveredAddress(digest, owner, vars.sig);
         _setProfileImageURI(vars.profileId, vars.imageURI);
     }
+
+    /**
+     * @dev Set Persona NFT
+     */
+    function setPersonaNFT(uint256 profileId, address memory personaNFT)
+        external
+        whenNotPaused
+    {
+        _validateCallerIsProfileOwnerOrDispatcher(profileId);
+        _profileById[profileId].personaNFT = personaNFT;
+    }
+
 
     /// @inheritdoc ILensHub
     function setFollowNFTURI(uint256 profileId, string calldata followNFTURI)
@@ -723,6 +754,13 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         return _profileById[profileId].followNFTURI;
     }
 
+    /**
+     * @dev Returns Persona NFT Address
+     */
+    function getPersonaNFT(uint256 profileId) external view override returns (address) {
+        return _profileById[profileId].personaNFT;
+    }
+
     /// @inheritdoc ILensHub
     function getCollectNFT(uint256 profileId, uint256 pubId)
         external
@@ -840,6 +878,15 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
      * @dev Overrides the ERC721 tokenURI function to return the associated URI with a given profile.
      */
     function tokenURI(uint256 tokenId) public view override returns (string memory) {
+
+        address personaAddr = getPersonaNFT(tokenId);
+        if(personaAddr !== address(0)){
+            //TODO: Pull URI From Persona NFT 
+            
+            // return ILensHub(HUB).getFollowNFTURI(_profileId);       //TODO! Fetch URI From Persona NFT
+            
+        }
+
         return _profileById[tokenId].imageURI; // temp
     }
 
