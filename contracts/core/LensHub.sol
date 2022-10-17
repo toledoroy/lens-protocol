@@ -1,18 +1,21 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT
 
 pragma solidity 0.8.10;
 
 import {ILensHub} from '../interfaces/ILensHub.sol';
 import {Events} from '../libraries/Events.sol';
 import {Helpers} from '../libraries/Helpers.sol';
+import {Constants} from '../libraries/Constants.sol';
 import {DataTypes} from '../libraries/DataTypes.sol';
 import {Errors} from '../libraries/Errors.sol';
 import {PublishingLogic} from '../libraries/PublishingLogic.sol';
+import {ProfileTokenURILogic} from '../libraries/ProfileTokenURILogic.sol';
 import {InteractionLogic} from '../libraries/InteractionLogic.sol';
 import {LensNFTBase} from './base/LensNFTBase.sol';
 import {LensMultiState} from './base/LensMultiState.sol';
 import {LensHubStorage} from './storage/LensHubStorage.sol';
 import {VersionedInitializable} from '../upgradeability/VersionedInitializable.sol';
+import {IERC721Enumerable} from '@openzeppelin/contracts/token/ERC721/extensions/IERC721Enumerable.sol';
 
 /**
  * @title LensHub
@@ -25,31 +28,12 @@ import {VersionedInitializable} from '../upgradeability/VersionedInitializable.s
  * number of NFT contracts and interactions at once. For that reason, we've made two quirky design decisions:
  *      1. Both Follow & Collect NFTs invoke an LensHub callback on transfer with the sole purpose of emitting an event.
  *      2. Almost every event in the protocol emits the current block timestamp, reducing the need to fetch it manually.
- * 
- *
- * Planned Changs:
- * 1. Hub Module: Groups
- * 2. Detabchable Profiles
- *
  */
-contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiState, LensHubStorage {
-    uint256 internal constant REVISION = 2;
+contract LensHub is LensNFTBase, VersionedInitializable, LensMultiState, LensHubStorage, ILensHub {
+    uint256 internal constant REVISION = 1;
 
     address internal immutable FOLLOW_NFT_IMPL;
     address internal immutable COLLECT_NFT_IMPL;
-
-
-
-
-    /**
-     * @dev Hub's Groups - Hub Owned NFT Representing Public Groups
-     * This should probably support multiple module implementation, and possibly multiple NFT implemetations as well
-     */
-    address internal immutable GROUP_NFT_IMPL;  
-    
-    // address internal immutable PROFILE_NFT_IMPL;        //NO. Allow for various contracts to be used for profiles
-
-
 
     /**
      * @dev This modifier reverts if the caller is not the configured governance address.
@@ -60,20 +44,14 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
     }
 
     /**
-     * @dev This modifier reverts if the caller is not a whitelisted profile creator address.
-     */
-    modifier onlyWhitelistedProfileCreator() {
-        _validateCallerIsWhitelistedProfileCreator();
-        _;
-    }
-
-    /**
      * @dev The constructor sets the immutable follow & collect NFT implementations.
      *
      * @param followNFTImpl The follow NFT implementation address.
      * @param collectNFTImpl The collect NFT implementation address.
      */
     constructor(address followNFTImpl, address collectNFTImpl) {
+        if (followNFTImpl == address(0)) revert Errors.InitParamsInvalid();
+        if (collectNFTImpl == address(0)) revert Errors.InitParamsInvalid();
         FOLLOW_NFT_IMPL = followNFTImpl;
         COLLECT_NFT_IMPL = collectNFTImpl;
     }
@@ -112,8 +90,13 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
 
     /// @inheritdoc ILensHub
     function setState(DataTypes.ProtocolState newState) external override {
-        if (msg.sender != _governance && msg.sender != _emergencyAdmin)
+        if (msg.sender == _emergencyAdmin) {
+            if (newState == DataTypes.ProtocolState.Unpaused)
+                revert Errors.EmergencyAdminCannotUnpause();
+            _validateNotPaused();
+        } else if (msg.sender != _governance) {
             revert Errors.NotGovernanceOrEmergencyAdmin();
+        }
         _setState(newState);
     }
 
@@ -162,30 +145,65 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         external
         override
         whenNotPaused
-        onlyWhitelistedProfileCreator
+        returns (uint256)
     {
-        uint256 profileId = ++_profileCounter;
-        _mint(vars.to, profileId);
-        PublishingLogic.createProfile(
-            vars,
-            profileId,
-            _profileIdByHandleHash,
-            _profileById,
-            _followModuleWhitelisted
-        );
+        if (!_profileCreatorWhitelisted[msg.sender]) revert Errors.ProfileCreatorNotWhitelisted();
+        unchecked {
+            uint256 profileId = ++_profileCounter;
+            _mint(vars.to, profileId);
+            PublishingLogic.createProfile(
+                vars,
+                profileId,
+                _profileIdByHandleHash,
+                _profileById,
+                _followModuleWhitelisted
+            );
+            return profileId;
+        }
+    }
+
+    /// @inheritdoc ILensHub
+    function setDefaultProfile(uint256 profileId) external override whenNotPaused {
+        _setDefaultProfile(msg.sender, profileId);
+    }
+
+    /// @inheritdoc ILensHub
+    function setDefaultProfileWithSig(DataTypes.SetDefaultProfileWithSigData calldata vars)
+        external
+        override
+        whenNotPaused
+    {
+        unchecked {
+            _validateRecoveredAddress(
+                _calculateDigest(
+                    keccak256(
+                        abi.encode(
+                            SET_DEFAULT_PROFILE_WITH_SIG_TYPEHASH,
+                            vars.wallet,
+                            vars.profileId,
+                            sigNonces[vars.wallet]++,
+                            vars.sig.deadline
+                        )
+                    )
+                ),
+                vars.wallet,
+                vars.sig
+            );
+            _setDefaultProfile(vars.wallet, vars.profileId);
+        }
     }
 
     /// @inheritdoc ILensHub
     function setFollowModule(
         uint256 profileId,
         address followModule,
-        bytes calldata followModuleData
+        bytes calldata followModuleInitData
     ) external override whenNotPaused {
         _validateCallerIsProfileOwner(profileId);
         PublishingLogic.setFollowModule(
             profileId,
             followModule,
-            followModuleData,
+            followModuleInitData,
             _profileById[profileId],
             _followModuleWhitelisted
         );
@@ -198,31 +216,28 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         whenNotPaused
     {
         address owner = ownerOf(vars.profileId);
-        bytes32 digest;
         unchecked {
-            digest = keccak256(
-                abi.encodePacked(
-                    '\x19\x01',
-                    _calculateDomainSeparator(),
+            _validateRecoveredAddress(
+                _calculateDigest(
                     keccak256(
                         abi.encode(
                             SET_FOLLOW_MODULE_WITH_SIG_TYPEHASH,
                             vars.profileId,
                             vars.followModule,
-                            keccak256(vars.followModuleData),
+                            keccak256(vars.followModuleInitData),
                             sigNonces[owner]++,
                             vars.sig.deadline
                         )
                     )
-                )
+                ),
+                owner,
+                vars.sig
             );
         }
-
-        _validateRecoveredAddress(digest, owner, vars.sig);
         PublishingLogic.setFollowModule(
             vars.profileId,
             vars.followModule,
-            vars.followModuleData,
+            vars.followModuleInitData,
             _profileById[vars.profileId],
             _followModuleWhitelisted
         );
@@ -241,12 +256,9 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         whenNotPaused
     {
         address owner = ownerOf(vars.profileId);
-        bytes32 digest;
         unchecked {
-            digest = keccak256(
-                abi.encodePacked(
-                    '\x19\x01',
-                    _calculateDomainSeparator(),
+            _validateRecoveredAddress(
+                _calculateDigest(
                     keccak256(
                         abi.encode(
                             SET_DISPATCHER_WITH_SIG_TYPEHASH,
@@ -256,11 +268,11 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
                             vars.sig.deadline
                         )
                     )
-                )
+                ),
+                owner,
+                vars.sig
             );
         }
-
-        _validateRecoveredAddress(digest, owner, vars.sig);
         _setDispatcher(vars.profileId, vars.dispatcher);
     }
 
@@ -281,12 +293,9 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         whenNotPaused
     {
         address owner = ownerOf(vars.profileId);
-        bytes32 digest;
         unchecked {
-            digest = keccak256(
-                abi.encodePacked(
-                    '\x19\x01',
-                    _calculateDomainSeparator(),
+            _validateRecoveredAddress(
+                _calculateDigest(
                     keccak256(
                         abi.encode(
                             SET_PROFILE_IMAGE_URI_WITH_SIG_TYPEHASH,
@@ -296,25 +305,13 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
                             vars.sig.deadline
                         )
                     )
-                )
+                ),
+                owner,
+                vars.sig
             );
         }
-
-        _validateRecoveredAddress(digest, owner, vars.sig);
         _setProfileImageURI(vars.profileId, vars.imageURI);
     }
-
-    /**
-     * @dev Set Persona NFT
-     */
-    function setPersonaNFT(uint256 profileId, address memory personaNFT)
-        external
-        whenNotPaused
-    {
-        _validateCallerIsProfileOwnerOrDispatcher(profileId);
-        _profileById[profileId].personaNFT = personaNFT;
-    }
-
 
     /// @inheritdoc ILensHub
     function setFollowNFTURI(uint256 profileId, string calldata followNFTURI)
@@ -333,12 +330,9 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         whenNotPaused
     {
         address owner = ownerOf(vars.profileId);
-        bytes32 digest;
         unchecked {
-            digest = keccak256(
-                abi.encodePacked(
-                    '\x19\x01',
-                    _calculateDomainSeparator(),
+            _validateRecoveredAddress(
+                _calculateDigest(
                     keccak256(
                         abi.encode(
                             SET_FOLLOW_NFT_URI_WITH_SIG_TYPEHASH,
@@ -348,25 +342,31 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
                             vars.sig.deadline
                         )
                     )
-                )
+                ),
+                owner,
+                vars.sig
             );
         }
-
-        _validateRecoveredAddress(digest, owner, vars.sig);
         _setFollowNFTURI(vars.profileId, vars.followNFTURI);
     }
 
     /// @inheritdoc ILensHub
-    function post(DataTypes.PostData calldata vars) external override whenPublishingEnabled {
+    function post(DataTypes.PostData calldata vars)
+        external
+        override
+        whenPublishingEnabled
+        returns (uint256)
+    {
         _validateCallerIsProfileOwnerOrDispatcher(vars.profileId);
-        _createPost(
-            vars.profileId,
-            vars.contentURI,
-            vars.collectModule,
-            vars.collectModuleData,
-            vars.referenceModule,
-            vars.referenceModuleData
-        );
+        return
+            _createPost(
+                vars.profileId,
+                vars.contentURI,
+                vars.collectModule,
+                vars.collectModuleInitData,
+                vars.referenceModule,
+                vars.referenceModuleInitData
+            );
     }
 
     /// @inheritdoc ILensHub
@@ -374,46 +374,50 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         external
         override
         whenPublishingEnabled
+        returns (uint256)
     {
         address owner = ownerOf(vars.profileId);
-        bytes32 digest;
         unchecked {
-            digest = keccak256(
-                abi.encodePacked(
-                    '\x19\x01',
-                    _calculateDomainSeparator(),
+            _validateRecoveredAddress(
+                _calculateDigest(
                     keccak256(
                         abi.encode(
                             POST_WITH_SIG_TYPEHASH,
                             vars.profileId,
                             keccak256(bytes(vars.contentURI)),
                             vars.collectModule,
-                            keccak256(vars.collectModuleData),
+                            keccak256(vars.collectModuleInitData),
                             vars.referenceModule,
-                            keccak256(vars.referenceModuleData),
+                            keccak256(vars.referenceModuleInitData),
                             sigNonces[owner]++,
                             vars.sig.deadline
                         )
                     )
-                )
+                ),
+                owner,
+                vars.sig
             );
         }
-
-        _validateRecoveredAddress(digest, owner, vars.sig);
-        _createPost(
-            vars.profileId,
-            vars.contentURI,
-            vars.collectModule,
-            vars.collectModuleData,
-            vars.referenceModule,
-            vars.referenceModuleData
-        );
+        return
+            _createPost(
+                vars.profileId,
+                vars.contentURI,
+                vars.collectModule,
+                vars.collectModuleInitData,
+                vars.referenceModule,
+                vars.referenceModuleInitData
+            );
     }
 
     /// @inheritdoc ILensHub
-    function comment(DataTypes.CommentData calldata vars) external override whenPublishingEnabled {
+    function comment(DataTypes.CommentData calldata vars)
+        external
+        override
+        whenPublishingEnabled
+        returns (uint256)
+    {
         _validateCallerIsProfileOwnerOrDispatcher(vars.profileId);
-        _createComment(vars);
+        return _createComment(vars);
     }
 
     /// @inheritdoc ILensHub
@@ -421,14 +425,12 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         external
         override
         whenPublishingEnabled
+        returns (uint256)
     {
         address owner = ownerOf(vars.profileId);
-        bytes32 digest;
         unchecked {
-            digest = keccak256(
-                abi.encodePacked(
-                    '\x19\x01',
-                    _calculateDomainSeparator(),
+            _validateRecoveredAddress(
+                _calculateDigest(
                     keccak256(
                         abi.encode(
                             COMMENT_WITH_SIG_TYPEHASH,
@@ -436,43 +438,45 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
                             keccak256(bytes(vars.contentURI)),
                             vars.profileIdPointed,
                             vars.pubIdPointed,
-                            vars.collectModule,
-                            keccak256(vars.collectModuleData),
-                            vars.referenceModule,
                             keccak256(vars.referenceModuleData),
+                            vars.collectModule,
+                            keccak256(vars.collectModuleInitData),
+                            vars.referenceModule,
+                            keccak256(vars.referenceModuleInitData),
                             sigNonces[owner]++,
                             vars.sig.deadline
                         )
                     )
-                )
+                ),
+                owner,
+                vars.sig
             );
         }
-
-        _validateRecoveredAddress(digest, owner, vars.sig);
-        _createComment(
-            DataTypes.CommentData(
-                vars.profileId,
-                vars.contentURI,
-                vars.profileIdPointed,
-                vars.pubIdPointed,
-                vars.collectModule,
-                vars.collectModuleData,
-                vars.referenceModule,
-                vars.referenceModuleData
-            )
-        );
+        return
+            _createComment(
+                DataTypes.CommentData(
+                    vars.profileId,
+                    vars.contentURI,
+                    vars.profileIdPointed,
+                    vars.pubIdPointed,
+                    vars.referenceModuleData,
+                    vars.collectModule,
+                    vars.collectModuleInitData,
+                    vars.referenceModule,
+                    vars.referenceModuleInitData
+                )
+            );
     }
 
     /// @inheritdoc ILensHub
-    function mirror(DataTypes.MirrorData calldata vars) external override whenPublishingEnabled {
+    function mirror(DataTypes.MirrorData calldata vars)
+        external
+        override
+        whenPublishingEnabled
+        returns (uint256)
+    {
         _validateCallerIsProfileOwnerOrDispatcher(vars.profileId);
-        _createMirror(
-            vars.profileId,
-            vars.profileIdPointed,
-            vars.pubIdPointed,
-            vars.referenceModule,
-            vars.referenceModuleData
-        );
+        return _createMirror(vars);
     }
 
     /// @inheritdoc ILensHub
@@ -480,38 +484,41 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         external
         override
         whenPublishingEnabled
+        returns (uint256)
     {
         address owner = ownerOf(vars.profileId);
-        bytes32 digest;
         unchecked {
-            digest = keccak256(
-                abi.encodePacked(
-                    '\x19\x01',
-                    _calculateDomainSeparator(),
+            _validateRecoveredAddress(
+                _calculateDigest(
                     keccak256(
                         abi.encode(
                             MIRROR_WITH_SIG_TYPEHASH,
                             vars.profileId,
                             vars.profileIdPointed,
                             vars.pubIdPointed,
-                            vars.referenceModule,
                             keccak256(vars.referenceModuleData),
+                            vars.referenceModule,
+                            keccak256(vars.referenceModuleInitData),
                             sigNonces[owner]++,
                             vars.sig.deadline
                         )
                     )
-                )
+                ),
+                owner,
+                vars.sig
             );
         }
-
-        _validateRecoveredAddress(digest, owner, vars.sig);
-        _createMirror(
-            vars.profileId,
-            vars.profileIdPointed,
-            vars.pubIdPointed,
-            vars.referenceModule,
-            vars.referenceModuleData
-        );
+        return
+            _createMirror(
+                DataTypes.MirrorData(
+                    vars.profileId,
+                    vars.profileIdPointed,
+                    vars.pubIdPointed,
+                    vars.referenceModuleData,
+                    vars.referenceModule,
+                    vars.referenceModuleInitData
+                )
+            );
     }
 
     /**
@@ -551,15 +558,16 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         external
         override
         whenNotPaused
+        returns (uint256[] memory)
     {
-        InteractionLogic.follow(
-            msg.sender,
-            profileIds,
-            datas,
-            FOLLOW_NFT_IMPL,
-            _profileById,
-            _profileIdByHandleHash
-        );
+        return
+            InteractionLogic.follow(
+                msg.sender,
+                profileIds,
+                datas,
+                _profileById,
+                _profileIdByHandleHash
+            );
     }
 
     /// @inheritdoc ILensHub
@@ -567,18 +575,19 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         external
         override
         whenNotPaused
+        returns (uint256[] memory)
     {
-        bytes32[] memory dataHashes = new bytes32[](vars.datas.length);
-        for (uint256 i = 0; i < vars.datas.length; ++i) {
+        uint256 dataLength = vars.datas.length;
+        bytes32[] memory dataHashes = new bytes32[](dataLength);
+        for (uint256 i = 0; i < dataLength; ) {
             dataHashes[i] = keccak256(vars.datas[i]);
+            unchecked {
+                ++i;
+            }
         }
-
-        bytes32 digest;
         unchecked {
-            digest = keccak256(
-                abi.encodePacked(
-                    '\x19\x01',
-                    _calculateDomainSeparator(),
+            _validateRecoveredAddress(
+                _calculateDigest(
                     keccak256(
                         abi.encode(
                             FOLLOW_WITH_SIG_TYPEHASH,
@@ -588,19 +597,19 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
                             vars.sig.deadline
                         )
                     )
-                )
+                ),
+                vars.follower,
+                vars.sig
             );
         }
-
-        _validateRecoveredAddress(digest, vars.follower, vars.sig);
-        InteractionLogic.follow(
-            vars.follower,
-            vars.profileIds,
-            vars.datas,
-            FOLLOW_NFT_IMPL,
-            _profileById,
-            _profileIdByHandleHash
-        );
+        return
+            InteractionLogic.follow(
+                vars.follower,
+                vars.profileIds,
+                vars.datas,
+                _profileById,
+                _profileIdByHandleHash
+            );
     }
 
     /// @inheritdoc ILensHub
@@ -608,16 +617,17 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         uint256 profileId,
         uint256 pubId,
         bytes calldata data
-    ) external override whenNotPaused {
-        InteractionLogic.collect(
-            msg.sender,
-            profileId,
-            pubId,
-            data,
-            COLLECT_NFT_IMPL,
-            _pubByIdByProfile,
-            _profileById
-        );
+    ) external override whenNotPaused returns (uint256) {
+        return
+            InteractionLogic.collect(
+                msg.sender,
+                profileId,
+                pubId,
+                data,
+                COLLECT_NFT_IMPL,
+                _pubByIdByProfile,
+                _profileById
+            );
     }
 
     /// @inheritdoc ILensHub
@@ -625,13 +635,11 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         external
         override
         whenNotPaused
+        returns (uint256)
     {
-        bytes32 digest;
         unchecked {
-            digest = keccak256(
-                abi.encodePacked(
-                    '\x19\x01',
-                    _calculateDomainSeparator(),
+            _validateRecoveredAddress(
+                _calculateDigest(
                     keccak256(
                         abi.encode(
                             COLLECT_WITH_SIG_TYPEHASH,
@@ -642,20 +650,21 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
                             vars.sig.deadline
                         )
                     )
-                )
+                ),
+                vars.collector,
+                vars.sig
             );
         }
-
-        _validateRecoveredAddress(digest, vars.collector, vars.sig);
-        InteractionLogic.collect(
-            vars.collector,
-            vars.profileId,
-            vars.pubId,
-            vars.data,
-            COLLECT_NFT_IMPL,
-            _pubByIdByProfile,
-            _profileById
-        );
+        return
+            InteractionLogic.collect(
+                vars.collector,
+                vars.profileId,
+                vars.pubId,
+                vars.data,
+                COLLECT_NFT_IMPL,
+                _pubByIdByProfile,
+                _profileById
+            );
     }
 
     /// @inheritdoc ILensHub
@@ -702,6 +711,11 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         returns (bool)
     {
         return _profileCreatorWhitelisted[profileCreator];
+    }
+
+    /// @inheritdoc ILensHub
+    function defaultProfile(address wallet) external view override returns (uint256) {
+        return _defaultProfileByAddress[wallet];
     }
 
     /// @inheritdoc ILensHub
@@ -752,13 +766,6 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
     /// @inheritdoc ILensHub
     function getFollowNFTURI(uint256 profileId) external view override returns (string memory) {
         return _profileById[profileId].followNFTURI;
-    }
-
-    /**
-     * @dev Returns Persona NFT Address
-     */
-    function getPersonaNFT(uint256 profileId) external view override returns (address) {
-        return _profileById[profileId].personaNFT;
     }
 
     /// @inheritdoc ILensHub
@@ -865,12 +872,10 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
             return DataTypes.PubType.Nonexistent;
         } else if (_pubByIdByProfile[profileId][pubId].collectModule == address(0)) {
             return DataTypes.PubType.Mirror;
+        } else if (_pubByIdByProfile[profileId][pubId].profileIdPointed == 0) {
+            return DataTypes.PubType.Post;
         } else {
-            if (_pubByIdByProfile[profileId][pubId].profileIdPointed == 0) {
-                return DataTypes.PubType.Post;
-            } else {
-                return DataTypes.PubType.Comment;
-            }
+            return DataTypes.PubType.Comment;
         }
     }
 
@@ -878,16 +883,25 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
      * @dev Overrides the ERC721 tokenURI function to return the associated URI with a given profile.
      */
     function tokenURI(uint256 tokenId) public view override returns (string memory) {
+        address followNFT = _profileById[tokenId].followNFT;
+        return
+            ProfileTokenURILogic.getProfileTokenURI(
+                tokenId,
+                followNFT == address(0) ? 0 : IERC721Enumerable(followNFT).totalSupply(),
+                ownerOf(tokenId),
+                _profileById[tokenId].handle,
+                _profileById[tokenId].imageURI
+            );
+    }
 
-        address personaAddr = getPersonaNFT(tokenId);
-        if(personaAddr !== address(0)){
-            //TODO: Pull URI From Persona NFT 
-            
-            // return ILensHub(HUB).getFollowNFTURI(_profileId);       //TODO! Fetch URI From Persona NFT
-            
-        }
+    /// @inheritdoc ILensHub
+    function getFollowNFTImpl() external view override returns (address) {
+        return FOLLOW_NFT_IMPL;
+    }
 
-        return _profileById[tokenId].imageURI; // temp
+    /// @inheritdoc ILensHub
+    function getCollectNFTImpl() external view override returns (address) {
+        return COLLECT_NFT_IMPL;
     }
 
     /// ****************************
@@ -907,50 +921,64 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         bytes memory collectModuleData,
         address referenceModule,
         bytes memory referenceModuleData
-    ) internal {
-        PublishingLogic.createPost(
-            profileId,
-            contentURI,
-            collectModule,
-            collectModuleData,
-            referenceModule,
-            referenceModuleData,
-            ++_profileById[profileId].pubCount,
-            _pubByIdByProfile,
-            _collectModuleWhitelisted,
-            _referenceModuleWhitelisted
-        );
+    ) internal returns (uint256) {
+        unchecked {
+            uint256 pubId = ++_profileById[profileId].pubCount;
+            PublishingLogic.createPost(
+                profileId,
+                contentURI,
+                collectModule,
+                collectModuleData,
+                referenceModule,
+                referenceModuleData,
+                pubId,
+                _pubByIdByProfile,
+                _collectModuleWhitelisted,
+                _referenceModuleWhitelisted
+            );
+            return pubId;
+        }
     }
 
-    function _createComment(DataTypes.CommentData memory vars) internal {
-        PublishingLogic.createComment(
-            vars,
-            _profileById[vars.profileId].pubCount + 1,
-            _profileById,
-            _pubByIdByProfile,
-            _collectModuleWhitelisted,
-            _referenceModuleWhitelisted
-        );
-        _profileById[vars.profileId].pubCount++;
+    /*
+     * If the profile ID is zero, this is the equivalent of "unsetting" a default profile.
+     * Note that the wallet address should either be the message sender or validated via a signature
+     * prior to this function call.
+     */
+    function _setDefaultProfile(address wallet, uint256 profileId) internal {
+        if (profileId > 0 && wallet != ownerOf(profileId)) revert Errors.NotProfileOwner();
+
+        _defaultProfileByAddress[wallet] = profileId;
+
+        emit Events.DefaultProfileSet(wallet, profileId, block.timestamp);
     }
 
-    function _createMirror(
-        uint256 profileId,
-        uint256 profileIdPointed,
-        uint256 pubIdPointed,
-        address referenceModule,
-        bytes calldata referenceModuleData
-    ) internal {
-        PublishingLogic.createMirror(
-            profileId,
-            profileIdPointed,
-            pubIdPointed,
-            referenceModule,
-            referenceModuleData,
-            ++_profileById[profileId].pubCount,
-            _pubByIdByProfile,
-            _referenceModuleWhitelisted
-        );
+    function _createComment(DataTypes.CommentData memory vars) internal returns (uint256) {
+        unchecked {
+            uint256 pubId = ++_profileById[vars.profileId].pubCount;
+            PublishingLogic.createComment(
+                vars,
+                pubId,
+                _profileById,
+                _pubByIdByProfile,
+                _collectModuleWhitelisted,
+                _referenceModuleWhitelisted
+            );
+            return pubId;
+        }
+    }
+
+    function _createMirror(DataTypes.MirrorData memory vars) internal returns (uint256) {
+        unchecked {
+            uint256 pubId = ++_profileById[vars.profileId].pubCount;
+            PublishingLogic.createMirror(
+                vars,
+                pubId,
+                _pubByIdByProfile,
+                _referenceModuleWhitelisted
+            );
+            return pubId;
+        }
     }
 
     function _setDispatcher(uint256 profileId, address dispatcher) internal {
@@ -958,12 +986,14 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         emit Events.DispatcherSet(profileId, dispatcher, block.timestamp);
     }
 
-    function _setProfileImageURI(uint256 profileId, string memory imageURI) internal {
+    function _setProfileImageURI(uint256 profileId, string calldata imageURI) internal {
+        if (bytes(imageURI).length > Constants.MAX_PROFILE_IMAGE_URI_LENGTH)
+            revert Errors.ProfileImageURILengthInvalid();
         _profileById[profileId].imageURI = imageURI;
         emit Events.ProfileImageURISet(profileId, imageURI, block.timestamp);
     }
 
-    function _setFollowNFTURI(uint256 profileId, string memory followNFTURI) internal {
+    function _setFollowNFTURI(uint256 profileId, string calldata followNFTURI) internal {
         _profileById[profileId].followNFTURI = followNFTURI;
         emit Events.FollowNFTURISet(profileId, followNFTURI, block.timestamp);
     }
@@ -977,16 +1007,23 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
         address from,
         address to,
         uint256 tokenId
-    ) internal override {
+    ) internal override whenNotPaused {
         if (_dispatcherByProfile[tokenId] != address(0)) {
             _setDispatcher(tokenId, address(0));
         }
+
+        if (_defaultProfileByAddress[from] == tokenId) {
+            _defaultProfileByAddress[from] = 0;
+        }
+
         super._beforeTokenTransfer(from, to, tokenId);
     }
 
     function _validateCallerIsProfileOwnerOrDispatcher(uint256 profileId) internal view {
-        if (msg.sender != ownerOf(profileId) && msg.sender != _dispatcherByProfile[profileId])
-            revert Errors.NotProfileOwnerOrDispatcher();
+        if (msg.sender == ownerOf(profileId) || msg.sender == _dispatcherByProfile[profileId]) {
+            return;
+        }
+        revert Errors.NotProfileOwnerOrDispatcher();
     }
 
     function _validateCallerIsProfileOwner(uint256 profileId) internal view {
@@ -995,10 +1032,6 @@ contract LensHub is ILensHub, LensNFTBase, VersionedInitializable, LensMultiStat
 
     function _validateCallerIsGovernance() internal view {
         if (msg.sender != _governance) revert Errors.NotGovernance();
-    }
-
-    function _validateCallerIsWhitelistedProfileCreator() internal view {
-        if (!_profileCreatorWhitelisted[msg.sender]) revert Errors.ProfileCreatorNotWhitelisted();
     }
 
     function getRevision() internal pure virtual override returns (uint256) {

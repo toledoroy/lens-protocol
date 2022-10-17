@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT
 pragma solidity 0.8.10;
 
 import {DataTypes} from '../libraries/DataTypes.sol';
@@ -58,6 +58,8 @@ contract MockLensHubV2Storage {
     mapping(bytes32 => uint256) internal _profileIdByHandleHash;
     mapping(uint256 => DataTypes.ProfileStruct) internal _profileById;
     mapping(uint256 => mapping(uint256 => DataTypes.PublicationStruct)) internal _pubByIdByProfile;
+
+    mapping(address => uint256) internal _defaultProfileByAddress;
 
     uint256 internal _profileCounter;
     address internal _governance;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT
 
 pragma solidity 0.8.10;
 
@@ -18,12 +18,14 @@ contract MockReferenceModule is IReferenceModule {
     function processComment(
         uint256 profileId,
         uint256 profileIdPointed,
-        uint256 pubIdPointed
+        uint256 pubIdPointed,
+        bytes calldata data
     ) external override {}
 
     function processMirror(
         uint256 profileId,
         uint256 profileIdPointed,
-        uint256 pubIdPointed
+        uint256 pubIdPointed,
+        bytes calldata data
     ) external override {}
 }

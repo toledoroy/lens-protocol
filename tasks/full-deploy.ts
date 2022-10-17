@@ -7,7 +7,7 @@ import {
   ApprovalFollowModule__factory,
   CollectNFT__factory,
   Currency__factory,
-  EmptyCollectModule__factory,
+  FreeCollectModule__factory,
   FeeCollectModule__factory,
   FeeFollowModule__factory,
   FollowerOnlyReferenceModule__factory,
@@ -20,12 +20,18 @@ import {
   RevertCollectModule__factory,
   TimedFeeCollectModule__factory,
   TransparentUpgradeableProxy__factory,
+  ProfileTokenURILogic__factory,
+  LensPeriphery__factory,
+  UIDataProvider__factory,
+  ProfileFollowModule__factory,
+  RevertFollowModule__factory,
+  ProfileCreationProxy__factory,
 } from '../typechain-types';
 import { deployContract, waitForTx } from './helpers/utils';
 
 const TREASURY_FEE_BPS = 50;
-const LENS_HUB_NFT_NAME = 'Various Vegetables';
-const LENS_HUB_NFT_SYMBOL = 'VVGT';
+const LENS_HUB_NFT_NAME = 'Lens Protocol Profiles';
+const LENS_HUB_NFT_SYMBOL = 'LPP';
 
 task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre) => {
   // Note that the use of these signers is a placeholder and is not meant to be used in
@@ -35,11 +41,13 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
   const deployer = accounts[0];
   const governance = accounts[1];
   const treasuryAddress = accounts[2].address;
+  const proxyAdminAddress = deployer.address;
+  const profileCreatorAddress = deployer.address;
 
   // Nonce management in case of deployment issues
   let deployerNonce = await ethers.provider.getTransactionCount(deployer.address);
 
-  console.log('\n\t -- Deploying Module Globals --');
+  console.log('\n\t-- Deploying Module Globals --');
   const moduleGlobals = await deployContract(
     new ModuleGlobals__factory(deployer).deploy(
       governance.address,
@@ -57,9 +65,14 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
   const interactionLogic = await deployContract(
     new InteractionLogic__factory(deployer).deploy({ nonce: deployerNonce++ })
   );
+  const profileTokenURILogic = await deployContract(
+    new ProfileTokenURILogic__factory(deployer).deploy({ nonce: deployerNonce++ })
+  );
   const hubLibs = {
     'contracts/libraries/PublishingLogic.sol:PublishingLogic': publishingLogic.address,
     'contracts/libraries/InteractionLogic.sol:InteractionLogic': interactionLogic.address,
+    'contracts/libraries/ProfileTokenURILogic.sol:ProfileTokenURILogic':
+      profileTokenURILogic.address,
   };
 
   // Here, we pre-compute the nonces and addresses used to deploy the contracts.
@@ -72,7 +85,8 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
     '0x' + keccak256(RLP.encode([deployer.address, followNFTNonce])).substr(26);
   const collectNFTImplAddress =
     '0x' + keccak256(RLP.encode([deployer.address, collectNFTNonce])).substr(26);
-  const hubProxyAddress = '0x' + keccak256(RLP.encode([deployer.address, hubProxyNonce])).substr(26);
+  const hubProxyAddress =
+    '0x' + keccak256(RLP.encode([deployer.address, hubProxyNonce])).substr(26);
 
   // Next, we deploy first the hub implementation, then the followNFT implementation, the collectNFT, and finally the
   // hub proxy with initialization.
@@ -99,11 +113,10 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
   ]);
 
   console.log('\n\t-- Deploying Hub Proxy --');
-
   let proxy = await deployContract(
     new TransparentUpgradeableProxy__factory(deployer).deploy(
       lensHubImpl.address,
-      deployer.address,
+      proxyAdminAddress,
       data,
       { nonce: deployerNonce++ }
     )
@@ -111,6 +124,11 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
 
   // Connect the hub proxy to the LensHub factory and the governance for ease of use.
   const lensHub = LensHub__factory.connect(proxy.address, governance);
+
+  console.log('\n\t-- Deploying Lens Periphery --');
+  const lensPeriphery = await new LensPeriphery__factory(deployer).deploy(lensHub.address, {
+    nonce: deployerNonce++,
+  });
 
   // Currency
   console.log('\n\t-- Deploying Currency --');
@@ -150,9 +168,9 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
   const revertCollectModule = await deployContract(
     new RevertCollectModule__factory(deployer).deploy({ nonce: deployerNonce++ })
   );
-  console.log('\n\t-- Deploying emptyCollectModule --');
-  const emptyCollectModule = await deployContract(
-    new EmptyCollectModule__factory(deployer).deploy(lensHub.address, { nonce: deployerNonce++ })
+  console.log('\n\t-- Deploying freeCollectModule --');
+  const freeCollectModule = await deployContract(
+    new FreeCollectModule__factory(deployer).deploy(lensHub.address, { nonce: deployerNonce++ })
   );
 
   // Deploy follow modules
@@ -162,15 +180,43 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
       nonce: deployerNonce++,
     })
   );
-  console.log('\n\t-- Deploying approvalFollowModule --');
-  const approvalFollowModule = await deployContract(
-    new ApprovalFollowModule__factory(deployer).deploy(lensHub.address, { nonce: deployerNonce++ })
+  console.log('\n\t-- Deploying profileFollowModule --');
+  const profileFollowModule = await deployContract(
+    new ProfileFollowModule__factory(deployer).deploy(lensHub.address, {
+      nonce: deployerNonce++,
+    })
   );
+  console.log('\n\t-- Deploying revertFollowModule --');
+  const revertFollowModule = await deployContract(
+    new RevertFollowModule__factory(deployer).deploy(lensHub.address, {
+      nonce: deployerNonce++,
+    })
+  );
+  // --- COMMENTED OUT AS THIS IS NOT A LAUNCH MODULE ---
+  // console.log('\n\t-- Deploying approvalFollowModule --');
+  // const approvalFollowModule = await deployContract(
+  //   new ApprovalFollowModule__factory(deployer).deploy(lensHub.address, { nonce: deployerNonce++ })
+  // );
 
   // Deploy reference module
   console.log('\n\t-- Deploying followerOnlyReferenceModule --');
   const followerOnlyReferenceModule = await deployContract(
     new FollowerOnlyReferenceModule__factory(deployer).deploy(lensHub.address, {
+      nonce: deployerNonce++,
+    })
+  );
+
+  // Deploy UIDataProvider
+  console.log('\n\t-- Deploying UI Data Provider --');
+  const uiDataProvider = await deployContract(
+    new UIDataProvider__factory(deployer).deploy(lensHub.address, {
+      nonce: deployerNonce++,
+    })
+  );
+
+  console.log('\n\t-- Deploying Profile Creation Proxy --');
+  const profileCreationProxy = await deployContract(
+    new ProfileCreationProxy__factory(deployer).deploy(profileCreatorAddress, lensHub.address, {
       nonce: deployerNonce++,
     })
   );
@@ -187,7 +233,9 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
     })
   );
   await waitForTx(
-    lensHub.whitelistCollectModule(timedFeeCollectModule.address, true, { nonce: governanceNonce++ })
+    lensHub.whitelistCollectModule(timedFeeCollectModule.address, true, {
+      nonce: governanceNonce++,
+    })
   );
   await waitForTx(
     lensHub.whitelistCollectModule(limitedTimedFeeCollectModule.address, true, {
@@ -198,7 +246,7 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
     lensHub.whitelistCollectModule(revertCollectModule.address, true, { nonce: governanceNonce++ })
   );
   await waitForTx(
-    lensHub.whitelistCollectModule(emptyCollectModule.address, true, { nonce: governanceNonce++ })
+    lensHub.whitelistCollectModule(freeCollectModule.address, true, { nonce: governanceNonce++ })
   );
 
   // Whitelist the follow modules
@@ -207,8 +255,15 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
     lensHub.whitelistFollowModule(feeFollowModule.address, true, { nonce: governanceNonce++ })
   );
   await waitForTx(
-    lensHub.whitelistFollowModule(approvalFollowModule.address, true, { nonce: governanceNonce++ })
+    lensHub.whitelistFollowModule(profileFollowModule.address, true, { nonce: governanceNonce++ })
   );
+  await waitForTx(
+    lensHub.whitelistFollowModule(revertFollowModule.address, true, { nonce: governanceNonce++ })
+  );
+  // --- COMMENTED OUT AS THIS IS NOT A LAUNCH MODULE ---
+  // await waitForTx(
+  // lensHub.whitelistFollowModule(approvalFollowModule.address, true, { nonce: governanceNonce++ })
+  // );
 
   // Whitelist the reference module
   console.log('\n\t-- Whitelisting Reference Module --');
@@ -226,6 +281,14 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
       .whitelistCurrency(currency.address, true, { nonce: governanceNonce++ })
   );
 
+  // Whitelist the profile creation proxy
+  console.log('\n\t-- Whitelisting Profile Creation Proxy --');
+  await waitForTx(
+    lensHub.whitelistProfileCreator(profileCreationProxy.address, true, {
+      nonce: governanceNonce++,
+    })
+  );
+
   // Save and log the addresses
   const addrs = {
     'lensHub proxy': lensHub.address,
@@ -235,16 +298,22 @@ task('full-deploy', 'deploys the entire Lens Protocol').setAction(async ({}, hre
     'follow NFT impl': followNFTImplAddress,
     'collect NFT impl': collectNFTImplAddress,
     currency: currency.address,
+    'lens periphery': lensPeriphery.address,
     'module globals': moduleGlobals.address,
     'fee collect module': feeCollectModule.address,
     'limited fee collect module': limitedFeeCollectModule.address,
     'timed fee collect module': timedFeeCollectModule.address,
     'limited timed fee collect module': limitedTimedFeeCollectModule.address,
     'revert collect module': revertCollectModule.address,
-    'empty collect module': emptyCollectModule.address,
+    'free collect module': freeCollectModule.address,
     'fee follow module': feeFollowModule.address,
-    'approval follow module': approvalFollowModule.address,
+    'profile follow module': profileFollowModule.address,
+    'revert follow module': revertFollowModule.address,
+    // --- COMMENTED OUT AS THIS IS NOT A LAUNCH MODULE ---
+    // 'approval follow module': approvalFollowModule.address,
     'follower only reference module': followerOnlyReferenceModule.address,
+    'UI data provider': uiDataProvider.address,
+    'Profile creation proxy': profileCreationProxy.address,
   };
   const json = JSON.stringify(addrs, null, 2);
   console.log(json);

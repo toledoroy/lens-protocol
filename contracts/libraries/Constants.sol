@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT
 
 pragma solidity 0.8.10;
 
@@ -8,4 +8,5 @@ library Constants {
     string internal constant COLLECT_NFT_NAME_INFIX = '-Collect-';
     string internal constant COLLECT_NFT_SYMBOL_INFIX = '-Cl-';
     uint8 internal constant MAX_HANDLE_LENGTH = 31;
+    uint16 internal constant MAX_PROFILE_IMAGE_URI_LENGTH = 6000;
 }

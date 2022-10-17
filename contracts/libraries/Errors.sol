@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT
 
 pragma solidity 0.8.10;
 
@@ -13,6 +13,7 @@ library Errors {
     error TokenDoesNotExist();
     error NotGovernance();
     error NotGovernanceOrEmergencyAdmin();
+    error EmergencyAdminCannotUnpause();
     error CallerNotWhitelistedModule();
     error CollectModuleNotWhitelisted();
     error FollowModuleNotWhitelisted();
@@ -20,18 +21,23 @@ library Errors {
     error ProfileCreatorNotWhitelisted();
     error NotProfileOwner();
     error NotProfileOwnerOrDispatcher();
+    error NotDispatcher();
     error PublicationDoesNotExist();
     error HandleTaken();
     error HandleLengthInvalid();
     error HandleContainsInvalidCharacters();
+    error HandleFirstCharInvalid();
+    error ProfileImageURILengthInvalid();
     error CallerNotFollowNFT();
     error CallerNotCollectNFT();
     error BlockNumberInvalid();
     error ArrayMismatch();
+    error CannotCommentOnSelf();
+    error NotWhitelisted();
+    error InvalidParameter();
 
     // Module Errors
     error InitParamsInvalid();
-    error ZeroCurrency();
     error CollectExpired();
     error FollowInvalid();
     error ModuleDataMismatch();
